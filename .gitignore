@@ -1,0 +1,8 @@
+node_modules/
+test-results/
+reports/
+auth/storageState.json
+.env
+blob-report/
+playwright-report/
+allure-report/
