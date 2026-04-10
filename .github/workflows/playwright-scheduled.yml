@@ -1,0 +1,9 @@
+name: 🌙 Nightly Regression
+on:
+  schedule:
+    - cron: '0 0 * * *'
+  workflow_dispatch:
+jobs:
+  regression:
+    uses: ./.github/workflows/playwright.yml
+    secrets: inherit
