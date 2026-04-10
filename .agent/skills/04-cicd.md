@@ -1,0 +1,146 @@
+# Skill: CI/CD — GitHub Actions
+
+## Workflow Overview
+```
+install → test (4 shards, parallel) → report (merge + publish) → notify (on failure)
+```
+
+## `.github/workflows/playwright.yml`
+```yaml
+name: 🎭 Playwright E2E
+
+on:
+  push:         { branches: [main, develop] }
+  pull_request: { branches: [main, develop] }
+  workflow_dispatch:
+
+env:
+  NODE_VERSION: '20'
+
+jobs:
+  install:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: '${{ env.NODE_VERSION }}', cache: npm }
+      - run: npm ci
+      - name: Cache browsers
+        id: cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: pw-${{ hashFiles('package-lock.json') }}
+      - if: steps.cache.outputs.cache-hit != 'true'
+        run: npx playwright install --with-deps
+      - uses: actions/upload-artifact@v4
+        with: { name: node-modules, path: node_modules, retention-days: 1 }
+
+  test:
+    needs: install
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4]
+        total: [4]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: '${{ env.NODE_VERSION }}' }
+      - uses: actions/download-artifact@v4
+        with: { name: node-modules, path: node_modules }
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: pw-${{ hashFiles('package-lock.json') }}
+      - name: Run tests
+        run: npx playwright test --shard=${{ matrix.shard }}/${{ matrix.total }} --reporter=blob
+        env:
+          BASE_URL           : ${{ secrets.BASE_URL }}
+          API_BASE_URL       : ${{ secrets.API_BASE_URL }}
+          TEST_USER_EMAIL    : ${{ secrets.TEST_USER_EMAIL }}
+          TEST_USER_PASSWORD : ${{ secrets.TEST_USER_PASSWORD }}
+          CI: true
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: blob-report-${{ matrix.shard }}
+          path: blob-report/
+          retention-days: 7
+
+  report:
+    needs: test
+    runs-on: ubuntu-latest
+    if: always()
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: '${{ env.NODE_VERSION }}', cache: npm }
+      - run: npm ci
+      - uses: actions/download-artifact@v4
+        with: { pattern: blob-report-*, merge-multiple: true, path: all-blobs/ }
+      - run: npx playwright merge-reports --reporter html,json ./all-blobs
+      - uses: actions/upload-artifact@v4
+        with: { name: html-report, path: playwright-report/, retention-days: 30 }
+      - run: npm install -g allure-commandline
+      - run: allure generate reports/allure-results --clean -o allure-report
+      - name: Deploy Allure → GitHub Pages
+        if: github.ref == 'refs/heads/main'
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: allure-report
+          destination_dir: allure
+      - name: Job Summary
+        if: always()
+        run: |
+          echo "## 🎭 Test Results" >> $GITHUB_STEP_SUMMARY
+          node -e "
+            const r = JSON.parse(require('fs').readFileSync('reports/json/results.json','utf-8'));
+            const {passed=0,failed=0,skipped=0,flaky=0} = r.stats||{};
+            console.log(\`| ✅ \${passed} | ❌ \${failed} | ⏭️ \${skipped} | 🔄 \${flaky} | \${failed>0?'❌ FAILED':'✅ PASSED'} |\`);
+          " >> $GITHUB_STEP_SUMMARY
+
+  notify:
+    needs: test
+    if: failure() && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: slackapi/slack-github-action@v1.26.0
+        with:
+          payload: '{"text":"❌ Tests FAILED on main: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"}'
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+```
+
+## `.github/workflows/playwright-scheduled.yml`
+```yaml
+name: 🌙 Nightly Regression
+on:
+  schedule:
+    - cron: '0 0 * * *'
+  workflow_dispatch:
+jobs:
+  regression:
+    uses: ./.github/workflows/playwright.yml
+    secrets: inherit
+```
+
+## Secrets to Configure (GitHub → Settings → Secrets)
+| Secret | Value |
+|--------|-------|
+| `BASE_URL` | App URL for environment |
+| `API_BASE_URL` | API base URL |
+| `TEST_USER_EMAIL` | Test account email |
+| `TEST_USER_PASSWORD` | Test account password |
+| `SLACK_WEBHOOK_URL` | Slack incoming webhook (optional) |
+| `GITHUB_TOKEN` | Auto-provided by GitHub |
+
+## Key CI Flags
+| Config Key | CI Value | Reason |
+|---|---|---|
+| `forbidOnly` | `true` | Block accidental `.only` |
+| `retries` | `2` | Handle transient failures |
+| `workers` | `4` | Fixed for predictable resource use |
+| `reporter` | `blob` per shard | Merge after all shards complete |
